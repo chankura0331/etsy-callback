@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
 <meta charset="utf-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-LpkiD9OpYmACVfKHS19czG+a9c7IUuodBKU/SVVeJIk='; style-src 'sha256-cmIBodfxENz738+EacDZZXwKW25J18pKFh2/E6I7/AA='; connect-src 'none'; img-src 'none'; font-src 'none'; media-src 'none'; object-src 'none'; frame-src 'none'; worker-src 'none'; manifest-src 'none'; form-action 'none'; base-uri 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-x6hudbqv1IR2uTYSZOrj6FHo2wnu9QRhYf3Yv+P32jU='; style-src 'sha256-cmIBodfxENz738+EacDZZXwKW25J18pKFh2/E6I7/AA='; connect-src 'none'; img-src 'none'; font-src 'none'; media-src 'none'; object-src 'none'; frame-src 'none'; worker-src 'none'; manifest-src 'none'; form-action 'none'; base-uri 'none'">
 <meta name="referrer" content="no-referrer">
 <meta name="robots" content="noindex, nofollow">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -38,12 +38,13 @@
 <script>
 /*
  * EtsyBox: VM の公開鍵で、ブラウザの中だけで暗号化する（通信はしない）。
- * 形式は etsy-api/DESIGN.md 第3章（ETSYBOX1）。ブラウザと Node.js (>=20) の両方で動く。
+ * 形式は etsy-api/DESIGN.md 第3章（ETSYBOX2: 中身を RSA-OAEP で直接暗号化）。ブラウザと Node.js (>=20) の両方で動く。
  */
 var EtsyBox = (function () {
   'use strict';
-  var PREFIX = 'ETSYBOX1:';
-  var VERSION = 1;
+  var PREFIX = 'ETSYBOX2:';
+  var VERSION = 2;
+  var HASH_BYTES = 32; // OAEP のハッシュ（SHA-256）の長さ
   var subtle = globalThis.crypto && globalThis.crypto.subtle;
 
   function utf8(s) { return new TextEncoder().encode(s); }
@@ -85,26 +86,28 @@ var EtsyBox = (function () {
 
   async function keyIdHex(publicKeyPem) { return hex(await keyId(publicKeyPem)); }
 
-  /* payload（オブジェクト）を暗号化して "ETSYBOX1:..." を返す */
+  /* RSA-OAEP(SHA-256) で1回に暗号化できる最大バイト数 = 鍵のバイト数 - 2*32 - 2（RSA-4096 なら 446） */
+  function maxPlainBytes(modulusBits) { return modulusBits / 8 - 2 * HASH_BYTES - 2; }
+
+  /* payload（オブジェクト）を RSA-OAEP で直接暗号化して "ETSYBOX2:..." を返す（AES-GCM は使わない） */
   async function seal(publicKeyPem, payload) {
     if (!subtle) throw new Error('このブラウザは暗号化（WebCrypto）に対応していません');
     var spki = b64Decode(publicKeyPem);
     var rsaKey = await subtle.importKey('spki', spki, { name: 'RSA-OAEP', hash: 'SHA-256' }, false, ['encrypt']);
     var kid = await keyId(publicKeyPem);
-    var aesKey = await subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt']);
-    var rawAes = new Uint8Array(await subtle.exportKey('raw', aesKey));
-    var wrapped = new Uint8Array(await subtle.encrypt({ name: 'RSA-OAEP' }, rsaKey, rawAes));
-    rawAes.fill(0);
-    var iv = globalThis.crypto.getRandomValues(new Uint8Array(12));
-    var aad = concat([utf8('ETSYBOX1'), new Uint8Array([VERSION]), kid]);
     var plain = utf8(JSON.stringify(payload));
-    var ct = new Uint8Array(await subtle.encrypt({ name: 'AES-GCM', iv: iv, additionalData: aad }, aesKey, plain));
+    var max = maxPlainBytes(rsaKey.algorithm.modulusLength);
+    if (plain.length > max) {
+      var n = plain.length;
+      plain.fill(0);
+      throw new Error('暗号化する中身が大きすぎます（' + n + ' バイト、上限 ' + max + ' バイト）');
+    }
+    var ct = new Uint8Array(await subtle.encrypt({ name: 'RSA-OAEP' }, rsaKey, plain));
     plain.fill(0);
-    var lenBytes = new Uint8Array([(wrapped.length >> 8) & 0xff, wrapped.length & 0xff]);
-    return PREFIX + b64urlEncode(concat([new Uint8Array([VERSION]), kid, lenBytes, wrapped, iv, ct]));
+    return PREFIX + b64urlEncode(concat([new Uint8Array([VERSION]), kid, ct]));
   }
 
-  return { PREFIX: PREFIX, VERSION: VERSION, seal: seal, keyIdHex: keyIdHex };
+  return { PREFIX: PREFIX, VERSION: VERSION, seal: seal, keyIdHex: keyIdHex, maxPlainBytes: maxPlainBytes };
 })();
 if (typeof module === 'object' && module.exports) module.exports = EtsyBox;
 
@@ -115,7 +118,7 @@ if (typeof module === 'object' && module.exports) module.exports = EtsyBox;
 
   function copyText(textarea, msgEl) {
     var text = textarea.value;
-    function done(ok) { msgEl.textContent = ok ? 'コピーしました。チャットに貼って送ってください（ETSYBOX1: で始まる文字列）。' : 'コピーできませんでした。下の枠を長押しして「すべて選択」→「コピー」してください。'; }
+    function done(ok) { msgEl.textContent = ok ? 'コピーしました。チャットに貼って送ってください（ETSYBOX2: で始まる文字列）。' : 'コピーできませんでした。下の枠を長押しして「すべて選択」→「コピー」してください。'; }
     if (navigator.clipboard && navigator.clipboard.writeText) {
       navigator.clipboard.writeText(text).then(function () { done(true); }, function () { textarea.select(); done(false); });
     } else {
