@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-Kssdgbg6GRVbCa1UdLAfXFHZQhlfcJxAy/KgaBA86dc='; style-src 'sha256-cmIBodfxENz738+EacDZZXwKW25J18pKFh2/E6I7/AA='; connect-src 'none'; img-src 'none'; font-src 'none'; media-src 'none'; object-src 'none'; frame-src 'none'; worker-src 'none'; manifest-src 'none'; form-action 'none'; base-uri 'none'">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Etsy 接続の受け取り（暗号化ボックス）</title>
+<style>body{font-family:system-ui,-apple-system,"Hiragino Sans",sans-serif;margin:0;background:#fafafa;color:#222}main{max-width:40rem;margin:0 auto;padding:1rem}h1{font-size:1.3rem}h2{font-size:1.1rem;margin-top:1.5rem}section{background:#fff;border:1px solid #ddd;border-radius:8px;padding:1rem;margin:1rem 0}.note{font-size:.9rem;color:#444}.hint{font-size:.9rem;color:#555}label{display:block;margin-top:.8rem;font-weight:600}input,textarea{width:100%;box-sizing:border-box;font-size:16px;padding:.6rem;border:1px solid #bbb;border-radius:6px}textarea{font-family:ui-monospace,monospace;font-size:12px;word-break:break-all}button{margin-top:.8rem;font-size:1rem;padding:.7rem 1.2rem;border:0;border-radius:6px;background:#1a5fb4;color:#fff;width:100%}code{font-size:.85rem}</style>
+</head>
+<body>
+<main>
+  <h1>Etsy 接続の受け取り</h1>
+  <p class="note">このページは<strong>どこにも通信しません</strong>。入力や接続コードは、この端末の中でチームのVM専用の鍵で暗号化され、VM以外では読めません。<br>
+  鍵ID: <code id="kid">…</code></p>
+
+  <section id="auth" hidden>
+    <h2>接続コード（暗号化済み）</h2>
+    <p id="auth-msg">暗号化しています…</p>
+    <textarea id="auth-out" readonly rows="6" hidden></textarea>
+    <button type="button" id="auth-copy" hidden>コピー</button>
+    <p class="hint" id="auth-hint" hidden>「コピー」を押して、チャットにそのまま貼って送ってください。<strong>なるべくすぐ</strong>お願いします。</p>
+  </section>
+
+  <section id="keys">
+    <h2>キーを渡す（keystring と共有シークレット）</h2>
+    <p class="hint">Etsy の開発者ページから<strong>直接</strong>コピーして貼ってください（メモアプリを経由しない）。</p>
+    <label for="keystring">Keystring</label>
+    <input id="keystring" type="text" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" inputmode="text">
+    <label for="secret">Shared secret（共有シークレット）</label>
+    <input id="secret" type="password" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+    <button type="button" id="keys-seal">暗号化してコピー</button>
+    <p id="keys-msg" role="status"></p>
+    <textarea id="keys-out" readonly rows="6" hidden></textarea>
+  </section>
+</main>
+<script>
+/*
+ * EtsyBox: VM の公開鍵で、ブラウザの中だけで暗号化する（通信はしない）。
+ * 形式は etsy-api/DESIGN.md 第3章（ETSYBOX1）。ブラウザと Node.js (>=20) の両方で動く。
+ */
+var EtsyBox = (function () {
+  'use strict';
+  var PREFIX = 'ETSYBOX1:';
+  var VERSION = 1;
+  var subtle = globalThis.crypto && globalThis.crypto.subtle;
+
+  function utf8(s) { return new TextEncoder().encode(s); }
+
+  function b64urlEncode(bytes) {
+    var bin = '';
+    for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  }
+
+  function b64Decode(s) {
+    var clean = s.replace(/-----[^-]+-----/g, '').replace(/\s+/g, '').replace(/-/g, '+').replace(/_/g, '/');
+    var bin = atob(clean);
+    var out = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+
+  function concat(parts) {
+    var len = 0, i;
+    for (i = 0; i < parts.length; i++) len += parts[i].length;
+    var out = new Uint8Array(len), off = 0;
+    for (i = 0; i < parts.length; i++) { out.set(parts[i], off); off += parts[i].length; }
+    return out;
+  }
+
+  function hex(bytes) {
+    var s = '';
+    for (var i = 0; i < bytes.length; i++) s += ('0' + bytes[i].toString(16)).slice(-2);
+    return s;
+  }
+
+  /* 公開鍵（PEM または base64 の SPKI）→ 鍵ID（SHA-256 の先頭8バイト） */
+  async function keyId(publicKeyPem) {
+    var spki = b64Decode(publicKeyPem);
+    var digest = new Uint8Array(await subtle.digest('SHA-256', spki));
+    return digest.slice(0, 8);
+  }
+
+  async function keyIdHex(publicKeyPem) { return hex(await keyId(publicKeyPem)); }
+
+  /* payload（オブジェクト）を暗号化して "ETSYBOX1:..." を返す */
+  async function seal(publicKeyPem, payload) {
+    if (!subtle) throw new Error('このブラウザは暗号化（WebCrypto）に対応していません');
+    var spki = b64Decode(publicKeyPem);
+    var rsaKey = await subtle.importKey('spki', spki, { name: 'RSA-OAEP', hash: 'SHA-256' }, false, ['encrypt']);
+    var kid = await keyId(publicKeyPem);
+    var aesKey = await subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt']);
+    var rawAes = new Uint8Array(await subtle.exportKey('raw', aesKey));
+    var wrapped = new Uint8Array(await subtle.encrypt({ name: 'RSA-OAEP' }, rsaKey, rawAes));
+    rawAes.fill(0);
+    var iv = globalThis.crypto.getRandomValues(new Uint8Array(12));
+    var aad = concat([utf8('ETSYBOX1'), new Uint8Array([VERSION]), kid]);
+    var plain = utf8(JSON.stringify(payload));
+    var ct = new Uint8Array(await subtle.encrypt({ name: 'AES-GCM', iv: iv, additionalData: aad }, aesKey, plain));
+    plain.fill(0);
+    var lenBytes = new Uint8Array([(wrapped.length >> 8) & 0xff, wrapped.length & 0xff]);
+    return PREFIX + b64urlEncode(concat([new Uint8Array([VERSION]), kid, lenBytes, wrapped, iv, ct]));
+  }
+
+  return { PREFIX: PREFIX, VERSION: VERSION, seal: seal, keyIdHex: keyIdHex };
+})();
+if (typeof module === 'object' && module.exports) module.exports = EtsyBox;
+
+;(function () {
+  'use strict';
+  var PUBLIC_KEY = 'MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAxCRw4oxfzg6rjYnOpzacyGQF6YX4f/kR+UBxQFjZYZ6CN/tGb0IaYUzJcO4NZNs2Yr5PP1qjAwxHQt+JgXhIauvtKMdkZR3lpjjSmtP/dJee05I19KzNODkLspmbtbjp5mH41CFEWGBqL8xQ3YkK8PO4zlmMpqqwHzBaZ3kbnpyxUM4hqAB7SHe/Am1RoQdIv9nwwbue+SRnqgyeySFIJBWf0kkGQZL6Q1vb6ggDSBCnRe0bJ1mVy7h+Fc2/o/Zn7MxsDNv/pRWT0BJb5/Bgsx+S5DQARUa4EFj+mMhHGqmXHPKV5vIxT+Gwdee491Si5jjsnzPTfpiwRgVrt7kcyd7POI8aVkV2qogFETKoHCQquWnSYKlEbWgZQvoRXSqpde7BO3g68lp4QAkOcARzhMVtD6AnECPi5VKIjGW+yEcL5twmX+B4txzk8GgXmawybP0oCNoioZdj7JpkhmjaRToxoBgMh88XB6npTpWa6sB2cSOzyPqsLClOsAEFivpZDwMAbt7YGsiH6YqoQq9Ae11HKFx3TzeCMnWnAbbrLQSRgxQyjENKnsf3AhCXDuloyiO60tS1Wl8Pv9O+nbuYhqozys096G/XSXe7c4hL02n3air4SbrrJE1b+27Wsinhc6ZjX2Js30XLQ1bKUVWvm4M4RohU4H2qGIqUeeMytpsCAwEAAQ==';
+  var $ = function (id) { return document.getElementById(id); };
+
+  function copyText(textarea, msgEl) {
+    var text = textarea.value;
+    function done(ok) { msgEl.textContent = ok ? 'コピーしました。チャットに貼って送ってください（ETSYBOX1: で始まる文字列）。' : 'コピーできませんでした。下の枠を長押しして「すべて選択」→「コピー」してください。'; }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () { done(true); }, function () { textarea.select(); done(false); });
+    } else {
+      textarea.focus(); textarea.select();
+      var ok = false;
+      try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+      done(ok);
+    }
+  }
+
+  // 1) アドレスバーの値を読み、すぐに消す（履歴・共有に残さない）
+  var params = new URLSearchParams(window.location.search);
+  var code = params.get('code');
+  var state = params.get('state');
+  var error = params.get('error');
+  var errorDesc = params.get('error_description');
+  if (window.location.search || window.location.hash) {
+    history.replaceState(null, '', window.location.pathname);
+  }
+  params = null;
+
+  EtsyBox.keyIdHex(PUBLIC_KEY).then(function (k) { $('kid').textContent = k; },
+    function () { $('kid').textContent = '（読み込めません）'; });
+
+  // 2) 認可モード
+  if (code || error) {
+    $('auth').hidden = false;
+    if (error) {
+      $('auth-msg').textContent = 'Etsy から「' + error + '」が返りました' + (errorDesc ? '（' + errorDesc + '）' : '') +
+        '。接続はできていません。この画面のことをチャットで一言知らせてください（新しいリンクを送ります）。';
+    } else {
+      EtsyBox.seal(PUBLIC_KEY, { t: 'auth', code: code, state: state || '', ts: new Date().toISOString() })
+        .then(function (box) {
+          code = null; state = null;
+          $('auth-out').value = box;
+          $('auth-out').hidden = false; $('auth-copy').hidden = false; $('auth-hint').hidden = false;
+          $('auth-msg').textContent = '暗号化できました。';
+          $('auth-copy').addEventListener('click', function () { copyText($('auth-out'), $('auth-msg')); });
+        }, function (e) {
+          $('auth-msg').textContent = '暗号化に失敗しました（' + (e && e.message ? e.message : 'unknown') + '）。別のブラウザ（Safari／Chrome）で、ずっちーから新しいリンクをもらってください。';
+        });
+    }
+  }
+
+  // 3) キーを渡すモード
+  $('keys-seal').addEventListener('click', function () {
+    var ks = $('keystring').value.trim();
+    var sec = $('secret').value.trim();
+    if (!ks || !sec) { $('keys-msg').textContent = '2つの欄の両方を貼ってください。'; return; }
+    $('keys-msg').textContent = '暗号化しています…';
+    EtsyBox.seal(PUBLIC_KEY, { t: 'keys', keystring: ks, shared_secret: sec, ts: new Date().toISOString() })
+      .then(function (box) {
+        $('keystring').value = ''; $('secret').value = ''; ks = null; sec = null;
+        $('keys-out').value = box; $('keys-out').hidden = false;
+        copyText($('keys-out'), $('keys-msg'));
+      }, function (e) {
+        $('keys-msg').textContent = '暗号化に失敗しました（' + (e && e.message ? e.message : 'unknown') + '）。';
+      });
+  });
+})();
+</script>
+</body>
+</html>
